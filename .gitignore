@@ -3,3 +3,6 @@ dist
 .env
 .env.*
 .DS_Store
+
+# Copia de referencia del backend (Apps Script): nunca a GitHub
+apps-script/

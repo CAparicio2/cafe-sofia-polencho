@@ -1,5 +1,6 @@
 // Checkout: pagar ahora (QR/link de Mercado Pago o transferencia) o abrir una cuenta.
-// Todos los pagos son SIMULADOS en esta versión.
+// Los pagos son SIMULADOS en esta versión, pero la venta aprobada SÍ se registra
+// en el backend (Apps Script) a través de /api/pedido.
 import { useEffect, useRef, useState } from 'react'
 import Note from '../components/Note.jsx'
 import Steps from '../components/Steps.jsx'
@@ -7,6 +8,7 @@ import QrSimulado from '../components/QrSimulado.jsx'
 import { useCafe } from '../context/CafeContext.jsx'
 import { findProduct } from '../data/menu.js'
 import { ars, countItems, sumItems } from '../lib/format.js'
+import { nuevoOrderId, registrarVenta } from '../lib/pedidos.js'
 
 const METHODS = [
   { id: 'mp', label: 'QR o link de Mercado Pago' },
@@ -46,7 +48,14 @@ export default function Pago() {
   const [flow, setFlow] = useState(null)
   const timers = useRef([])
   const aliasRef = useRef(null)
-  useEffect(() => () => timers.current.forEach(clearTimeout), [])
+  const alive = useRef(true)
+  useEffect(() => {
+    alive.current = true
+    return () => {
+      alive.current = false
+      timers.current.forEach(clearTimeout)
+    }
+  }, [])
   const later = (fn, ms) => timers.current.push(setTimeout(fn, ms))
 
   const items = closingTab ? tab : cart
@@ -60,7 +69,8 @@ export default function Pago() {
     const tr = method === 'transfer'
     const last = closingTab ? 'Cuenta cerrada' : 'Pedido enviado a barra'
     const labels = [tr ? 'Verificando transferencia' : 'Procesando pago', tr ? 'Transferencia acreditada' : 'Pago aprobado', last]
-    const snap = { items: { ...items }, coupon, disc, tot, sub }
+    // orderId fijo para este intento: si hay que reintentar el aviso, el backend no duplica la venta.
+    const snap = { items: { ...items }, coupon, disc, tot, sub, method, orderId: nuevoOrderId() }
     setFlow({ kind: 'pay', snap, labels, states: ['active', '', ''] })
     setOrbState('thinking', 'warm')
     later(() => {
@@ -69,13 +79,27 @@ export default function Pago() {
         setFlow({ kind: 'pay', snap, fail: true, tr, labels: [tr ? 'Transferencia no recibida' : 'Pago rechazado', labels[1], last], states: ['fail', '', ''] })
         return
       }
-      setFlow({ kind: 'pay', snap, labels, states: ['done', 'done', 'active'] })
-      later(() => {
-        setFlow({ kind: 'pay', snap, labels, states: ['done', 'done', 'done'], done: true })
-        setOrbState('idle', 'warm')
-        finishOrder(snap.items, { sub: snap.sub, disc: snap.disc, tot: snap.tot })
-      }, 1100)
+      // Pago aprobado: ESTE es el momento en que la compra se confirma.
+      confirmarPedido(snap, labels)
     }, 1500)
+  }
+
+  // Avisa la venta al backend y, solo si quedó registrada, cierra la compra (recibo, historial).
+  const confirmarPedido = async (snap, labels) => {
+    setFlow({ kind: 'pay', snap, labels, states: ['done', 'done', 'active'] })
+    setOrbState('thinking', 'warm')
+    try {
+      await registrarVenta({ orderId: snap.orderId, items: snap.items, method: snap.method })
+    } catch (err) {
+      if (!alive.current) return
+      setOrbState('idle', 'cool')
+      setFlow({ kind: 'pay', snap, labels, states: ['done', 'done', 'fail'], sendError: err.message })
+      return
+    }
+    if (!alive.current) return
+    setFlow({ kind: 'pay', snap, labels, states: ['done', 'done', 'done'], done: true })
+    setOrbState('idle', 'warm')
+    finishOrder(snap.items, { sub: snap.sub, disc: snap.disc, tot: snap.tot })
   }
 
   // --- Abrir cuenta / sumar a la cuenta ---
@@ -202,6 +226,14 @@ export default function Pago() {
                   </span>
                 </Note>
                 <button className="btn block" style={{ marginTop: 10 }} onClick={() => setFlow(null)}>Elegir otro medio</button>
+              </>
+            )}
+            {flow.sendError && (
+              <>
+                <Note kind="bad" style={{ marginTop: 10 }}>
+                  <span>Tu pago quedó aprobado, pero no pudimos enviar el pedido a la barra. {flow.sendError} No se te cobrará de nuevo.</span>
+                </Note>
+                <button className="btn block" style={{ marginTop: 10 }} onClick={() => confirmarPedido(flow.snap, flow.labels)}>Reintentar</button>
               </>
             )}
             {flow.kind === 'pay' && flow.done && (
